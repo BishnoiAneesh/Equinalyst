@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# Local Docker volumes — real data must never be committed
+data/postgres/*
+!data/postgres/.gitkeep
+data/exports/*
+!data/exports/.gitkeep
+
+.DS_Store
