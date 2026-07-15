@@ -9,6 +9,12 @@ down:
 build:
 	docker compose build
 
+stop:
+	docker compose stop
+
+start:
+	docker compose start
+
 lint:
 	docker compose run --rm api ruff check .
 
