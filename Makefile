@@ -25,7 +25,7 @@ test:
 	docker compose run --rm api pytest -v
 
 seed:
-	docker compose run --rm api python scripts/seed.py
+	docker compose run --rm api python -m scripts.seed
 
 migrate:
 	docker compose run --rm api alembic upgrade head
