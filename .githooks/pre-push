@@ -1,5 +1,5 @@
 #!/bin/bash
-tree -I '.git|__pycache__|venv|*.egg-info|celerybeat-schedule' --dirsfirst > structure.txt
-git add structure.txt
+tree -I '.git|__pycache__|venv|*.egg-info|celerybeat-schedule' --dirsfirst > docs/architecture/structure.txt
+git add docs/architecture/structure.txt
 git commit -m "Auto-update structure.txt" --no-verify -q 2>/dev/null
 exit 0
