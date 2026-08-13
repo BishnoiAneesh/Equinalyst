@@ -1,0 +1,273 @@
+Phase 1 scope definition
+The MVP delivers one complete vertical slice: a user can ingest financial data for a listed Indian company by scraping Screener.in, run a DCF valuation with custom assumptions, save a version, and export it to Excel. Everything runs locally via Docker Compose — no cloud services required. Six sprints, approximately 8–10 weeks for a solo developer.
+
+The application is developed and run from Ubuntu WSL using Docker Compose. The roadmap below lets you explore each sprint's tasks, dependencies, and deliverable.
+
+________________________________________
+Phase 1 MVP — Build Roadmap
+
+Sprint 1 — Project Foundation & Environment
+Duration: ~1 week Dependencies: none
+Tasks:
+1.  [Infra] Initialise monorepo: FastAPI app skeleton, pyproject.toml, .env.example template, Makefile with targets for dev/test/lint/seed/migrate
+2.  [Infra] Write docker-compose.yml with five services: db (PostgreSQL 15), redis (Redis 7), api (FastAPI), worker (Celery worker), beat (Celery beat) — all sharing one .env file
+3.  [Infra] Write Dockerfile for the app image used by api, worker, and beat services — single image, different CMD per service to avoid image drift
+4.  [Infra] Configure Docker named volume postgres_data for PostgreSQL persistence and a bind-mounted export volume (./data/exports) for generated Excel files
+5.  [Infra] Set up asyncpg + SQLAlchemy 2.0 async; configure Celery with Redis broker and result backend; verify a test task runs end-to-end inside Docker
+6.  [Infra] Configure Alembic for schema migrations; establish migration naming convention; add make migrate target to Makefile
+7.  [Infra] Set up pytest with async support (pytest-asyncio); write a trivial passing test to confirm the test runner works against the Dockerised DB
+8.  [Infra] Set up GitHub Actions: lint (ruff), type-check (mypy), test on every push to main — tests run against a service container (postgres + redis) in CI, not against the local Docker stack
+Deliverable: docker-compose up brings up all five services. FastAPI connects to Postgres and Redis. Migrations run. CI passes.
+
+________________________________________
+Sprint 2 — Core Database Schema
+Duration: ~1 week Dependencies: Sprint 1
+Tasks:
+1.  [DB] Create companies table: id (UUID PK), ticker (VARCHAR, unique — NSE/BSE ticker symbol), exchange (VARCHAR — "NSE" | "BSE"), name, industry (VARCHAR — raw Screener.in label, display only), sector (VARCHAR — normalised sector classification against a fixed taxonomy), industry_group (VARCHAR — normalised sub-industry key used for peer grouping), screener_url (VARCHAR — canonical Screener.in company URL), created_at — NOTE: no user_id on this table; companies are a global, shared, deduplicated resource (see Sprint 5 note on user_watchlist)
+2.  [DB] Create financial_snapshots table: id, company_id (FK), ticker, scraped_at, period (TEXT — e.g. "FY2024"), shares_outstanding (NUMERIC — promoted to a real column since it's read by every valuation model and by portfolio analytics; do not bury it inside parsed_fields), face_value (NUMERIC — INR per share, also promoted for the same reason), raw_html_payload (TEXT — raw HTML stored for re-parsing), parsed_fields (JSONB — normalised financial fields; everything not cross-referenced by other modules stays here), ingested_at
+3.  [DB] Create market_data_points table: id, ticker, exchange, price (NUMERIC — INR), market_cap (NUMERIC — INR), pe_ratio (NUMERIC), book_value (NUMERIC), fetched_at, source — add index on (ticker, fetched_at DESC)
+4.  [DB] Create valuation_versions table: id, version_w (INT — data ingestion tier), version_x (INT — structural/calculation tier), version_z (INT — catch-all/tie-breaker tier), company_id (FK), model (TEXT), inputs_snapshot (JSONB), result_snapshot (JSONB), currency (TEXT DEFAULT 'INR'), created_at, note — add unique constraint on (company_id, version_w, version_x, version_z). Three tiers, not four: an earlier draft considered a fourth "Y" tier for routine API/program-value refreshes, but those never create a version row at all (see Sprint 7+ ValuationRefreshLog) — every version this table stores is displayed to the user as "W.X.Z" (e.g. "1.0.0" for a valuation's first version)
+5.  [DB] Create users table: id, email (unique), hashed_password, created_at — and refresh_tokens table for JWT rotation
+6.  [DB] Create export_jobs table: id, user_id (FK), valuation_version_id (FK), status (TEXT — "pending" | "processing" | "done" | "failed"), file_path (TEXT — local volume path), created_at, completed_at — this replaces the cloud object storage reference
+7.  [DB] Write Alembic migration for all tables; verify apply + rollback cleanly with make migrate and make rollback
+8.  [DB] Write SQLAlchemy ORM models for all tables; add repository classes with typed async CRUD methods
+9.  [DB] Seed script (scripts/seed.py): insert 2–3 real Indian listed companies (e.g. Reliance Industries, TCS, Infosys) with NSE tickers and pre-scraped financial snapshots from Screener.in so the valuation engine works without waiting for a live scrape run. Run with make seed.
+Deliverable: Complete schema live in Postgres inside Docker. ORM models with tests. make seed loads working data in one command.
+
+________________________________________
+Sprint 3 — Data Ingestion Module (Screener.in Scraper)
+Duration: ~1.5 weeks Dependencies: Sprint 2
+Tasks:
+1.  [Logic] Research Screener.in's HTML structure for company pages (e.g. https://www.screener.in/company/RELIANCE/); document the CSS selectors and table layout for: standalone vs consolidated financials tabs, the P&L table, Balance Sheet table, Cash Flow table, and the key ratios section at the top of the page
+2.  [Logic] Implement ScreenerScraper class using httpx (async HTTP) and BeautifulSoup4: given a ticker symbol, construct the Screener.in company URL, fetch the page with a realistic User-Agent header, parse and return raw HTML; implement retry logic with exponential backoff and respect a configurable SCRAPE_DELAY_SECONDS between requests to avoid rate-limiting
+3.  [Logic] Implement ScreenerParser class: given raw HTML from a Screener.in company page, extract the following fields from the consolidated financials tables — Revenue, Operating Profit, Net Profit (PAT), EPS, Total Assets, Total Liabilities, Total Debt, Equity Capital, Reserves, Cash and Cash Equivalents, Capex, Operating Cash Flow, Free Cash Flow; also extract key ratios — P/E, P/B, ROE, ROCE, Debt-to-Equity, Dividend Yield, Market Cap (INR Cr), Current Price (INR); also extract Shares Outstanding and Face Value into their own typed fields (not left inside the generic ratios dict) since Sprint 2's schema promotes these to real columns
+3b. [Logic] Implement ingestion.peer_parser (can land in Sprint 3 or be deferred to Sprint 7 — flagged here because it reuses the same HTML the scraper already fetches): extract Screener.in's own "Peer comparison" table from the company page — peer tickers plus their comparative ratios — for later use by the Sprint 7 peer comparison service; no new external dependency, just an additional selector on a page already being fetched
+4.  [Logic] Implement field_map.py: a dict mapping Screener.in display labels (e.g. "Net Profit", "Total Debt") to normalised internal field names; this file is a first-class artefact and must be committed with a comment explaining each mapping; handle common label variations across different company pages
+5.  [Logic] Implement multi-year extraction: Screener.in shows a 10-year history in tabular form; the parser must extract each fiscal year column header (e.g. "Mar 2024", "Mar 2023") and produce a list of year-keyed dicts rather than a single snapshot; store each as a separate financial_snapshots row with the period field set to the fiscal year (e.g. "FY2024")
+6.  [Logic] Write unit tests for ScreenerParser against 2–3 real HTML fixtures saved from Screener.in (save in tests/fixtures/screener/); assert correct field extraction for at least Revenue, PAT, Total Debt, and EPS for the most recent fiscal year; fixtures must be committed to the repo so tests run offline
+7.  [Logic] Implement ingestion writer service: takes parsed Screener output, upserts into financial_snapshots (one row per company × fiscal year); takes key ratios and current price, inserts into market_data_points
+8.  [Infra] Create Celery task ingest_company_data(company_id): orchestrates ScreenerScraper → ScreenerParser → writer; add error handling, retry policy (3 retries with exponential backoff), and a per-task rate-limit guard so concurrent tasks cannot fire more than 1 Screener request per SCRAPE_DELAY_SECONDS; on exhausting all retries, mark the task failed with a surfaced warning (not just a server-side log line) so the caller polling GET /tasks/{task_id} sees why ingestion didn't complete — the same fail-visibly-not-silently pattern used for Module 9 data source failures and Excel Add-in push/pull failures
+9.  [API] Endpoint POST /api/v1/companies: accepts ticker + exchange, derives the Screener.in URL (https://www.screener.in/company/{TICKER}/), creates company record, enqueues ingest task, returns 202 Accepted with task_id
+10. [API] Endpoint GET /api/v1/companies/{id}/financials: returns the list of financial_snapshots for a company ordered by period desc, each with its parsed_fields and the scraped_at timestamp
+11. [API] Endpoint GET /api/v1/tasks/{task_id}: returns Celery task status (pending / success / failure) — used by the frontend to poll ingestion progress
+Deliverable: POST a ticker → Screener.in scraped, multi-year financials stored in DB + current price cached. All via async Celery job with status polling. field_map.py committed and documented.
+
+________________________________________
+Sprint 4 — Valuation Engine + Versioning
+Duration: ~2 weeks Dependencies: Sprint 2 (can start in parallel with Sprint 3)
+Tasks:
+1.  [Logic] Define ValuationRequest and ValuationResult Pydantic models with full field validation; ValuationResult must include currency: Literal["INR"] and intrinsic_value_per_share in INR; include AssumptionValue with source enum (user/scraped/default). Reserve (nullable, unused in Phase 1) fields now so later models don't require a schema/shape migration: ValuationRequest.peer_company_ids (for relative valuation, Phase 2), ValuationRequest.components (list of sub-requests, for SOTP, Phase 2+); ValuationResult.components (list of sub-results, for SOTP), ValuationResult.peer_multiples_used (dict, for relative valuation audit trail). These stay null/unused for every Phase 1 model but must exist in the type now so DCF isn't accidentally the only shape the engine or API contracts assume.
+2.  [Logic] Define BaseValuationModel abstract class with compute(request) -> ValuationResult interface; add model registry dict for lookup by string key; the model Literal type should already list the full Phase 1+2 set (dcf, ddm, pe, ev_ebitda, ev_sales, peg, pb, residual_income, sotp, relative) even though only "dcf" has an implementing class in Phase 1 — this keeps the API contract and DB column stable as models are added later
+3.  [Logic] Implement DCFModel for Indian companies: project Free Cash Flow using a growth_rate assumption, discount at WACC, add terminal value using Gordon Growth model, divide by shares outstanding to get intrinsic value per share in INR; default WACC range should reflect Indian equity risk premium (historically 11–14% for large-cap Indian equities — document this assumption in the code); source FCF, shares outstanding, and historical growth from parsed Screener data in financial_snapshots
+4.  [Logic] Implement assumption resolver: given a ValuationRequest, pull default values from financial_snapshots (e.g. median historical revenue growth as default growth_rate, average historical ROCE as a proxy for WACC calibration), override with any user-supplied values, flag source on each field as "scraped" or "user"
+5.  [Logic] Implement basic scenario engine: accepts bull/base/bear override dicts; runs DCFModel three times; returns dict of scenario → intrinsic_value_per_share in INR
+6.  [Logic] Implement 2D sensitivity matrix: vary two assumptions (e.g. growth_rate × WACC) across ±N% range; return matrix as list[list[Decimal]] in INR
+7.  [Logic] Write unit tests for DCFModel with known inputs/outputs in INR; test scenario engine; test sensitivity matrix dimensions and value monotonicity
+8.  [Logic] Implement VersioningService.save_version(company_id, request, result, note, tier) -> ValuationVersion; auto-increment the appropriate tier per company using a SELECT FOR UPDATE sequence pattern, per this rule: a `tier="ingestion"` save bumps version_w by 1 and resets version_x and version_z to 0 (fresh financials pulled in for the company); a `tier="structural"` save bumps version_x by 1 and resets version_z to 0 (new model run, new/changed assumptions, a new Excel structure incorporated via refresh-with-structure); a `tier="tiebreak"` save bumps version_z by 1 only, for anything that creates a real version but doesn't cleanly fit ingestion or structural — a manual note-only save, or a revert (Module 3's revert-creates-a-new-version behaviour uses this tier). The very first version of any valuation is 1.0.0. Add (nullable, unused in Phase 1) workbook_manifest (JSONB) and parent_version_id (FK to valuation_versions, self-referential) columns now — these stay null until Sprint 7's Excel sync work, but adding the columns and the migration later, after real version rows already exist, is a needless second migration when it can be done for free alongside this one
+9.  [Logic] Implement VersioningService.diff(version_a_id, version_b_id) -> VersionDiff: compare inputs_snapshot dicts field-by-field; compute intrinsic_value_delta (INR) and delta_pct
+10. [API] Endpoint POST /api/v1/companies/{id}/valuations: accept ValuationRequest body, call engine, save version, return ValuationVersion with full result embedded
+11. [API] Endpoint GET /api/v1/companies/{id}/valuations/versions: return paginated list of ValuationVersion summaries ordered by (version_w, version_x, version_z) desc, each summary including the composed "W.X.Z" label
+12. [API] Endpoint GET /api/v1/companies/{id}/valuations/versions/{version_id}: return full ValuationVersion including inputs_snapshot and result_snapshot
+13. [API] Endpoint GET /api/v1/companies/{id}/valuations/diff?a={vid}&b={vid}: return VersionDiff object
+14. [API] Endpoint POST /api/v1/companies/{id}/valuations/refresh: enqueue Celery task that re-scrapes Screener.in for the company then re-runs latest valuation assumptions, saving a new version
+Deliverable: Full DCF computation in INR with versioning. Every run is immutable and diffable. Refresh enqueues a background re-scrape and re-computation.
+
+________________________________________
+Sprint 5 — Access Control + API Gateway Hardening
+Duration: ~2-3 days (reduced — this is a single-user application, confirmed during
+architecture review; no multi-tenant permission model is needed) Dependencies: Sprint 3 + Sprint 4
+Tasks:
+1.  [Infra] Protect the API with a single static API key (or a simple local session
+    cookie) checked via a FastAPI dependency on all non-health routes — enough to keep
+    the API from being wide open if it's ever exposed beyond localhost; NOT a
+    multi-user login/registration system, since there is only one user
+2.  [Infra] Add request validation error handler returning RFC 7807 problem+json format; add global exception handler that never leaks stack traces to clients
+3.  [Infra] Add slowapi rate limiting: primarily to protect against accidental self-inflicted load (e.g. a runaway script hammering the API), not abuse from other users — a generous single-key limit is enough; keep the tighter 5 req/min limit specifically on POST /companies since that triggers a Screener.in scrape and Screener's own rate limits are the real constraint
+4.  [Infra] Write integration tests covering the full valuation create-version-diff cycle against a test DB running inside Docker; tests must use saved HTML fixtures (not live Screener requests) for the ingestion step
+Deliverable: API not left open, without the overhead of a multi-user auth system that has no one to serve. companies/financial_snapshots have no user_id column and never will — there is no watchlist table (a plain query listing all companies covers the sole-user use case).
+
+________________________________________
+Sprint 6 — Excel Export + MVP Wrap-up
+Duration: ~1.5 weeks Dependencies: Sprint 4 + Sprint 5
+Tasks:
+1.  [Logic] Implement ExcelExportService using openpyxl: accepts a ValuationVersion, generates workbook with sheets — Financials, Assumptions, Valuation, Sensitivity, Summary
+2.  [Logic] Financials sheet: populate from financial_snapshots parsed_fields for the company (multi-year history scraped from Screener.in, INR values in Cr); label currency column header as "INR (₹ Cr)"; include a source note row: "Data sourced from Screener.in"
+3.  [Logic] Assumptions sheet: one row per assumption with columns — name, value (INR where applicable), source (user/scraped/default), resolved_at
+4.  [Logic] Valuation sheet: DCF projection table (years × FCF/discount/PV) in INR; terminal value row; intrinsic value per share in INR; all values as static numbers (no live formulas in MVP)
+5.  [Logic] Sensitivity sheet: render 2D sensitivity matrix (intrinsic value per share in INR) as a coloured table using openpyxl conditional formatting — green = high IV, red = low IV
+6.  [Infra] Celery task generate_excel_export(version_id): runs ExcelExportService, saves .xlsx file to ./data/exports/{version_id}.xlsx inside the Docker volume; writes file_path and status to export_jobs table. No cloud storage — the file lives on the local volume. Also writes the app-collected assumption inputs and output data points as pre-bound named cells (see Sprint 7+ Excel Add-in preview) so the exported file is ready to link, not just a static snapshot.
+7.  [API] Endpoint POST /api/v1/export/excel/{version_id}: enqueue Celery export task, return 202 with job_id
+8.  [API] Endpoint GET /api/v1/export/jobs/{job_id}: return job status + direct download URL (/api/v1/export/download/{job_id}) when complete
+9.  [API] Endpoint GET /api/v1/export/download/{job_id}: stream the .xlsx file from the local volume to the client
+10. [Infra] End-to-end smoke test: register → ingest (using saved fixture HTML, not live Screener) → valuate → export → download file and assert it opens with correct sheet names and non-empty INR values in the Valuation sheet
+11. [Infra] Write API documentation (FastAPI /docs auto-gen) + README covering: prerequisites (Ubuntu WSL2, Docker Desktop, Docker Compose), how to clone and run (make dev), how to run the seed (make seed), how Screener.in scraping works and its limitations, and how to execute a full valuation cycle via the /docs UI
+Deliverable: Complete MVP. Full cycle from Screener.in scrape to versioned DCF (INR) to downloadable Excel file, all behind auth, all running locally in Docker.
+
+________________________________________
+Sprint 7+ — Phase 2/3 preview: Peer Comparison, Excel Add-in, Data Source Catalog
+Not part of the Phase 1 MVP (see "What Phase 1 explicitly excludes" below) — captured here
+because Sprints 2 and 4 above already reserve the schema/shape these sprints will need, and
+it's useful to see what that reservation is for.
+
+Peer comparison (targets Phase 2, alongside portfolio analytics and the web UI):
+Final design after review — two permanently separate tiers, no promotion path between them.
+1.  [API] Endpoint GET /api/v1/companies/{id}/peers/suggestions: extract Screener.in's
+    peer-comparison table directly from the SUBJECT company's already-fetched HTML (no
+    new HTTP request), filtered to same sector/industry_group, capped at ~8 by default,
+    each with a quick-preview of key ratios — this is Tier A and is the ONLY data these
+    peers ever get; there is no later "upgrade" to full financials for a Tier A peer
+2.  [DB] Migration for peer_ratio_snapshots table: id, peer_ticker, peer_name,
+    sourced_from_company_id (FK), sourced_at, key_ratios (JSONB) — Tier A peers never
+    get a companies row
+3.  [API] Endpoint POST /api/v1/companies/{id}/peers: accept a confirmed peer set —
+    some subset of Tier A suggestions (cached as-is, no ingestion) plus/or Tier B
+    tickers not in the recommended table (create a Company row, enqueue the existing
+    ingest_company_data Celery task from Sprint 3 — full independent ingestion,
+    identical pipeline to adding any new company)
+4.  [DB] Migration for company_peers table: company_id, peer_ticker, tier
+    ("A_recommended_ratio_only" | "B_user_added_full_ingestion"), peer_company_id
+    (nullable — set only for Tier B), added_at
+5.  [Logic] Implement RelativeValuationModel(BaseValuationModel): pulls each confirmed
+    peer's data from the source appropriate to its tier (peer_ratio_snapshots for Tier
+    A, financial_snapshots for Tier B), computes peer-relative multiples (P/E,
+    EV/EBITDA, EV/Sales, PEG, P/B), applies to the subject company's fundamentals,
+    populates ValuationResult.peer_multiples_used for audit, and stores the confirmed
+    peer_set (with tier per peer) verbatim in inputs_snapshot
+6.  [Logic] Explicitly test the "no promotion" rule: running a standalone valuation on
+    a company that previously only appeared as a Tier A peer must trigger a completely
+    fresh ingestion, with zero reuse of the earlier peer_ratio_snapshots row
+7.  [Logic] Implement SOTPModel(BaseValuationModel): accepts ValuationRequest.components
+    (one sub-request per segment), computes each via its own model, sums to a single
+    intrinsic_value_per_share, populates ValuationResult.components
+
+Excel Add-in (targets Phase 3 — a genuinely separate TypeScript/Office.js project, scope
+it as its own phase rather than folding it into a backend sprint):
+Final workflow, confirmed during review — the app is the primary input surface. The user
+runs a valuation IN THE APP first (assumption form → compute → named output data points);
+only then, optionally, do they export a linked Excel workbook. The Add-in keeps that
+workbook's app-bound cells in sync going forward; it is not the starting point of a
+valuation.
+1.  [API] Endpoint GET /api/v1/valuations/assumption-schema/{model}: returns the
+    mandatory/optional assumption fields the app should collect for a given model,
+    before the user fills them in and runs the valuation
+2.  [Infra] Extend ExcelExportService (Sprint 6) to auto-generate named cells for
+    exactly two things that already exist by export time: the ValuationRequest's
+    resolved assumptions (INPUT cells) and the ValuationResult's output data points
+    (OUTPUT cells) — no manual task-pane binding step needed to create the initial set;
+    persist this mapping as workbook_manifest on the ValuationVersion (column already
+    added in Sprint 4)
+3.  [Infra] Embed a link identity into the exported file using Office.js's per-file
+    hidden settings store (Office.context.document.settings) — this survives save,
+    close, reopen, and Save-As duplication automatically, so a duplicated file stays
+    linked to the same lineage without any extra step from the user
+4.  [API] Endpoint POST /api/v1/excel/link/fork: mints a fresh link identity and a new
+    lineage root — the one explicit action needed when the user actually wants a
+    separate, independently-tracked workbook rather than an incidental local copy
+5.  [Infra] Office Add-in task pane (TypeScript) with a "Re-run" button: on click,
+    calls POST /api/v1/excel/link/push, receives current values for every app-bound
+    input cell (latest financials, any due Module-9 data-source refreshes), writes them
+    into the workbook's named input cells — Excel's own calculation engine recalculates
+    everything downstream, including any local sheets/tables/formulas the user has
+    added, without the Add-in or backend ever inspecting them. Sync is explicit and
+    button-triggered only — no automatic sync on file open, and no dependency on
+    OneDrive/SharePoint or the Microsoft Graph API for a closed file; this was a
+    deliberate simplification during review to remove the open-vs-closed-file ambiguity
+    entirely rather than build background sync
+6.  [API] Endpoint POST /api/v1/excel/link/pull: Add-in reads back only the fixed
+    output cells post-recalculation. What happens next depends on what the refresh
+    touched — see item 6a
+6a. [Logic] VersioningService.resolve_refresh_outcome(existing_version, new_inputs) ->
+    "new_version" | "log_only": if the refresh pulled in new financials or a structural
+    change (new/changed assumptions, new Excel structure), save a new ValuationVersion
+    per the Sprint 4 W/X/Z rule (ingestion bumps W, structural bumps X); if the refresh
+    only touched API/program-fed (datasource) values with no structural change, do NOT
+    create a new version — append a ValuationRefreshLog row instead (see item 6c). This
+    is the same rule the app's own Re-run button (item 9) uses, so both surfaces are
+    consistent about when a refresh is "just a log" versus "a real version"
+6b. [Infra] If the push or pull step fails outright — a named cell the Add-in expects
+    is missing from the sheet, or the write to a cell fails — surface a warning in the
+    task pane rather than failing silently; log the failure the same way a datasource
+    execution failure is logged (see Data source catalog, item 5 below)
+6c. [DB] Migration for valuation_refresh_log table: id, valuation_version_id (FK — which
+    version this refresh ran against), triggered_by (TEXT — "app" | "excel_addin"),
+    timestamp, datasource_outcomes (JSONB — per-source success/fail/fallback-used, and
+    which fallback mode was applied), named_outputs (JSONB — the resolved output
+    values/ranges this refresh produced). One row per Re-run click on either surface;
+    this table is also the home for the point-1 failure/fallback warning trail from the
+    data source catalog below, rather than a separate table
+7.  [Infra] Task pane affordance to optionally designate one additional cell as an
+    extra output binding — the exception path; the initial output set always comes
+    from the app-run valuation, not from manual binding
+8.  [API] Endpoint POST /api/v1/companies/{id}/valuations/{id}/refresh-with-structure:
+    regenerate a workbook from an existing version's workbook_manifest with refreshed
+    input values, creating a new ValuationVersion with parent_version_id set — for when
+    the user wants a clean regenerated file rather than syncing the one they've edited
+9.  [API] Endpoint POST /api/v1/companies/{id}/valuations/{id}/rerun: the app-side
+    "Re-run" button. Re-resolves every bound assumption (scraped values, catalog_builtin,
+    custom_api, custom_program), applies the log-only-vs-new-version rule from item 6a,
+    and returns either the new ValuationVersion or the new ValuationRefreshLog row
+
+Data source catalog (targets Phase 3, alongside or shortly after the Excel Add-in —
+catalog_builtin and custom_api are low-cost and can land early; custom_program should
+be its own dedicated sub-phase given the sandboxing work):
+1.  [DB] Migration for data_sources table: id, name, kind
+    ("catalog_builtin" | "custom_api" | "custom_program"), config (JSONB), version (int,
+    incremented on every edit), is_favorite (bool), last_known_good_value (NUMERIC,
+    nullable — cached on every successful resolution), last_known_good_at (TIMESTAMP,
+    nullable), created_at, updated_at. config carries, for every kind: timeout_seconds
+    (INT, pre-filled with 30, editable) and a fallback block — fallback_mode
+    ("fixed" | "last_known_good"); when fixed, fallback_source ("literal" |
+    "cell_reference") plus either fallback_value (NUMERIC, pre-filled with 1 as a
+    suggested default the user is expected to actually set meaningfully per source) or
+    fallback_cell_ref (TEXT — a named cell the user designates elsewhere on the linked
+    sheet, so the fallback can itself be a formula the user maintains rather than a
+    hardcoded constant)
+2.  [Logic] Seed a small fixed catalog_builtin set relevant to Indian equity valuation
+    (risk-free rate, current price, shares outstanding, a peer's ratio) — the field set
+    itself is fixed; the underlying provider/endpoint each one calls, and its fallback
+    configuration (fixed-literal / fixed-cell-reference / last-known-good), are all
+    user-editable via PATCH /datasources/{id}
+3.  [API] Endpoint POST /api/v1/datasources/custom-api: register a user-defined HTTP
+    endpoint + method + optional auth header + JSONPath extraction, plus timeout_seconds
+    and the fallback block described in item 1 — an external endpoint can fail or time
+    out just as easily as a custom program, so it gets the same protection; execution is
+    a generic authenticated-fetch-and-extract routine — response-size cap, no redirects
+    into private/internal network ranges; no code execution involved
+4.  [API] Endpoint POST /api/v1/datasources/custom-program: register user-authored code
+    that computes a value, optionally from other already-resolved assumptions, plus
+    timeout_seconds and the fallback block described in item 1
+5.  [Infra] Sandboxed execution environment for custom_program: execution timeout,
+    memory ceiling, no filesystem/network access unless explicitly granted per-program
+    — flagged explicitly as the most expensive single item across every sprint in this
+    plan; do not bundle it into the same sprint as catalog_builtin/custom_api, which
+    are both far cheaper. On execution failure for either custom_program or custom_api
+    (exception, timeout, or bad/unparseable output): log the failure, resolve the
+    fallback per the source's configured fallback_mode (the designated fixed
+    value/cell, or the cached last_known_good_value), and surface a warning — a
+    toast/popup in the app, and the equivalent banner in the Excel Add-in task pane when
+    the failure happens during an Add-in-triggered refresh. Apply the same
+    fail-visibly-not-silently pattern to Screener ingestion (already retried via Celery
+    per Sprint 3 — add a final surfaced warning, not just a server-side log line, once
+    all retries are exhausted) and to Add-in push/pull operations (item 6b above)
+6.  [API] Endpoint POST /api/v1/datasources/{id}/favorite: toggle is_favorite for
+    quick-pick ordering in the assumption-binding UI
+7.  [Logic] AssumptionValue gains source="datasource" with source_datasource_id and
+    source_datasource_version recorded at resolution time — required so editing a data
+    source later never silently rewrites what an old ValuationVersion's inputs_snapshot
+    says it used, preserving the immutability guarantee the rest of versioning depends on
+
+________________________________________
+Key implementation decisions to make before Sprint 3
+
+Three decisions will affect multiple sprints and are worth settling upfront rather than mid-build.
+
+The first is how to scrape Screener.in responsibly. Screener.in serves HTML pages that are publicly accessible without login for most data. Use httpx for async HTTP requests with a realistic User-Agent (e.g. mimicking a desktop browser) and a configurable delay between requests (default 2 seconds). Do not hammer the site — implement per-task rate limiting in Celery so concurrent workers cannot exceed 1 request per delay window. For Sprint 3 development and all CI tests, use saved HTML fixtures in tests/fixtures/screener/ rather than live requests; this makes tests fast, deterministic, and offline-safe. Document the scraping approach and its ethical constraints clearly in the README.
+
+The second is the field_map.py normalisation file. Screener.in display labels vary slightly across company pages and may change if Screener updates their UI. The field_map.py file must be the single source of truth for label-to-field mappings, versioned in the repo. Include fallback label variants as a list per field (e.g. ["Net Profit", "PAT", "Profit after tax"]) so the parser tries alternatives before failing. Log any unmapped label as a warning so regressions are caught early. Plan for re-scraping stored raw_html_payload without re-fetching from Screener when the field map is updated.
+
+The third is whether the valuation engine runs synchronously in the API request or as a Celery task. For Phase 1, run it synchronously — DCF is fast (milliseconds) and the added complexity of async job polling for a computation that completes in under a second is wasted overhead. Wrap it in a Celery task only if you later add Monte Carlo simulation, which can be slow.
+
+________________________________________
+What Phase 1 explicitly excludes
+
+To keep scope honest: no frontend (web app or Next.js), no portfolio analytics, no peer comparison or relative valuation, no SOTP, no Excel Add-in, no dynamic data source catalog, no multi-model valuation beyond DCF, no Monte Carlo simulation, no alert system, no LLM features, no multi-user auth (this is a single-user application — Sprint 5 is a minimal API-key check, not a login system), and no cloud deployment of any kind. These are all Phase 2 and beyond (see Sprint 7+ preview above for what Phase 2/3 looks like). What Phase 1 DOES include, deliberately, is a handful of nullable schema fields and type reservations (shares_outstanding/sector/face_value on companies and financial_snapshots, components/peer_set/peer_multiples_used on the valuation request/result types, workbook_manifest/parent_version_id on valuation_versions) that cost almost nothing to add now and avoid a second migration once those Phase 2/3 features are actually built. None of these reserved fields are read or written to by any Phase 1 code path. The MVP backend API is the foundation everything else builds on — ship it clean, running locally, with real Indian company data.

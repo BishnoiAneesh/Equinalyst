@@ -1,0 +1,591 @@
+Architecture recommendation: modular monolith
+For your stage, a modular monolith is the right call. Microservices add operational overhead (service mesh, distributed tracing, inter-service auth) that slows you down with no benefit at this scale. The modular monolith gives you clean boundaries between domains — so you can extract a service later if you need to — without the distributed systems tax upfront. Deploy as a single FastAPI app with clearly separated internal packages.
+The only exception: run Celery workers as a separate process from day one. Background jobs (Screener.in scrapes, data refresh, alerts, scheduled valuation runs) must not block API request handling.
+
+Deployment model: local offline via Docker Compose
+The entire stack runs locally using Docker Compose from an Ubuntu WSL environment. The source code resides in the Linux filesystem, Docker commands are executed from WSL, and all containers run using the WSL-integrated Docker engine. There is no cloud dependency. All services — FastAPI app, Celery worker, Celery beat scheduler, PostgreSQL, and Redis — are defined in docker-compose.yml and start with a single command. Object storage for Excel exports is replaced by a local volume mount. This is the correct choice for a portfolio project: it gives reviewers a reproducible environment they can spin up in under two minutes, and it keeps the architecture honest by avoiding cloud-specific assumptions.
+
+There are four files that support the offline setup and each has a real function:
+docker-compose.yml defines all services, their dependencies, environment variable injection, and bind mounts, and Docker named volumes. PostgreSQL uses the named volume postgres_data for persistent storage while generated exports are stored in a bind-mounted local directory. It is the single source of truth for the running environment.
+.env.example documents every required environment variable with safe default values — including SCRAPE_DELAY_SECONDS (default 2) and SCREENER_BASE_URL (default https://www.screener.in). Developers copy this to .env and run. No variable is undocumented.
+Makefile provides short aliases (make dev, make test, make seed, make migrate) so routine tasks do not require memorising long docker-compose commands. It is not decorative — every target maps to a real operation used during development.
+scripts/seed.py inserts two or three real Indian listed companies with pre-scraped Screener.in financial snapshots (stored as HTML fixtures in tests/fixtures/screener/) so the valuation engine works immediately without a live scrape.
+
+________________________________________
+Data source: Screener.in
+All financial data is sourced exclusively from Screener.in. Screener.in aggregates publicly disclosed financials for all NSE- and BSE-listed Indian companies and presents them as structured HTML tables, making it the single external dependency for this project. Each module that needs financial data reads from the database; only the ingestion module talks to Screener.in directly.
+
+Screener.in company pages follow a predictable URL pattern:
+  https://www.screener.in/company/{TICKER}/           — standalone financials (default)
+  https://www.screener.in/company/{TICKER}/consolidated/ — consolidated financials
+
+The ingestion module always targets the consolidated page for companies that publish consolidated results; it falls back to standalone if the consolidated tab is absent. This preference is stored as a boolean use_consolidated flag on the companies table.
+
+Data available from Screener.in company pages:
+  - P&L statement (10-year history): Revenue, Expenses, Operating Profit, OPM%, Other Income, Interest, Depreciation, Profit before tax, Tax, Net Profit, EPS
+  - Balance Sheet (10-year history): Equity Capital, Reserves, Borrowings, Other Liabilities, Total Liabilities, Fixed Assets, CWIP, Investments, Other Assets, Total Assets
+  - Cash Flow statement (10-year history): Cash from Operations, Cash from Investing, Cash from Financing, Net Cash Flow, Capex (derived)
+  - Key ratios (current + 10-year history): Market Cap (INR Cr), Current Price (INR), High / Low (52-week), Stock P/E, Book Value, Dividend Yield, ROCE, ROE, Face Value, Price-to-Book
+  - Quarterly results tab: available but out of scope for Phase 1
+
+All monetary values on Screener.in are in INR Crores (Cr) for company-level figures and INR for per-share figures. The ingestion module stores values as-is from Screener (INR Cr) and the valuation engine converts to per-share INR using shares outstanding when needed.
+
+________________________________________
+Module breakdown
+
+Module 1 — Data ingestion service (Screener.in scraper)
+Responsibilities: fetch and parse Screener.in company pages, extract multi-year financial tables and key ratios, write raw HTML and structured records to the database. This module owns all I/O with the outside world. Nothing else in the system talks to Screener.in directly.
+Inputs: ticker symbol and exchange from the user; HTML page from Screener.in.
+Outputs: structured FinancialSnapshot records (one per fiscal year) written to the database; a DataRefreshEvent published to the Celery queue so downstream modules know new data is available.
+
+Key data structures:
+python
+Company:
+  id: UUID
+  ticker: str                  # NSE/BSE ticker, unique — global/shared, not user-owned
+  exchange: str                 # "NSE" | "BSE"
+  name: str
+  sector: str                   # normalised sector classification (fixed taxonomy, not free text)
+  industry_group: str           # normalised sub-industry / peer-grouping key
+  industry: str                 # raw Screener.in label, kept for display only
+  screener_url: str
+  created_at: datetime
+
+FinancialSnapshot:
+  id: UUID
+  company_id: UUID
+  ticker: str                  # NSE/BSE ticker e.g. "RELIANCE"
+  scraped_at: datetime
+  period: str                  # "FY2024", "FY2023", etc.
+  use_consolidated: bool       # True if consolidated page was scraped
+  shares_outstanding: Decimal  # promoted to a real column — used by every valuation model
+                                # and by portfolio analytics; must not live only inside parsed_fields
+  face_value: Decimal          # INR per share — also promoted, needed for per-share conversions
+  raw_html_payload: TEXT       # full page HTML stored for re-parsing
+  parsed_fields: JSONB         # keyed by normalised field name, values in INR Cr — everything
+                                # that is NOT cross-referenced by other modules stays here
+  ingested_at: datetime
+
+MarketDataPoint:
+  ticker: str                  # e.g. "RELIANCE"
+  price: Decimal               # current price in INR
+  market_cap: Decimal          # INR Cr
+  pe_ratio: Decimal
+  book_value: Decimal          # INR per share
+  fetched_at: datetime
+  source: str                  # "screener"
+
+Design note on company ownership: this is a single-user application, so there is no
+multi-tenant sharing concern to design for. companies remain a single global,
+deduplicated table (unique on ticker) purely to avoid re-ingesting the same company's
+financials twice — once when it's a valuation subject, and again if it later shows up
+as a Tier B user-added peer (Module 7) for a different company. Tier A recommended
+peers (Module 7) never create a companies row at all — they're ratio-only data cached
+separately (PeerRatioSnapshot). No user_id or ownership concept belongs on this table.
+
+Internal packages: ingestion.screener_scraper (httpx async fetcher with rate limiting), ingestion.screener_parser (BeautifulSoup4 HTML → typed dict), ingestion.field_map (label normalisation), ingestion.peer_parser (extracts Screener.in's own "Peer comparison" table — ticker + comparative ratios — used to seed peer suggestions), ingestion.writer.
+
+Key implementation note: Screener.in renders financial tables with year headers as column labels (e.g. "Mar 2024", "Mar 2023") and metric names as row labels (e.g. "Revenue", "Net Profit"). The parser must transpose this HTML table structure into a list of year-keyed dicts. Maintain field_map.py as a first-class project artefact mapping Screener display labels to normalised internal field names; include fallback label variants per field and log unmapped labels as warnings. Re-parsing stored raw_html_payload must be possible without re-fetching from Screener, so the raw HTML must be preserved faithfully.
+
+________________________________________
+Module 2 — Valuation engine
+Responsibilities: execute valuation models (DCF, DDM, P/E, EV/EBITDA, P/B), apply user-supplied assumptions, pull dynamic variables from the financial snapshot cache, run scenario and sensitivity analysis, produce a structured output object. This module is pure computation — it reads from the database but never writes directly; it hands results to the versioning module.
+
+All monetary values are in Indian Rupees (INR). Intrinsic value output is per share in INR, consistent with how Indian equity prices are quoted on NSE/BSE. Screener.in stores company-level figures in INR Cr; the engine converts to per-share INR using shares_outstanding from parsed_fields before computing intrinsic value.
+
+Inputs: a ValuationRequest containing the company ID, model type, and a full assumptions map (user-defined + scraped-data-sourced overrides).
+Outputs: a ValuationResult object with intrinsic value per share (INR), value range, scenario outputs, sensitivity matrix, and the full resolved input snapshot.
+
+Key data structures:
+python
+ValuationRequest:
+  company_id: UUID
+  model: Literal["dcf","ddm","pe","ev_ebitda","ev_sales","peg","pb","residual_income","sotp","relative"]
+  assumptions: dict[str, AssumptionValue]  # a value may be sourced from a DataSource (Module 9)
+                                            # rather than typed by hand — see AssumptionValue.source
+  scenarios: list[ScenarioSpec]        # bull/base/bear overrides
+  run_simulation: bool
+  peer_set: list[PeerReference] | None  # populated only for model == "relative"; each entry
+                                         # tagged Tier A (ratio-only, from PeerRatioSnapshot) or
+                                         # Tier B (full FinancialSnapshot, own Company row) — see
+                                         # Module 7. Never mixes tiers silently; each peer's tier
+                                         # is explicit in the stored request for audit purposes.
+  components: list["ValuationRequest"] | None
+                                        # populated only for model == "sotp"; one sub-request
+                                        # per segment/business unit being summed
+
+AssumptionValue:
+  value: Decimal
+  source: Literal["user","scraped","default","datasource"]
+  source_datasource_id: UUID | None    # set only when source == "datasource" (Module 9)
+  source_datasource_version: int | None  # pins the exact config/code version used, so later
+                                          # edits to that DataSource never rewrite what an old
+                                          # version's inputs_snapshot says it used
+  resolved_at: datetime
+
+ValuationResult:
+  intrinsic_value_per_share: Decimal   # INR — the single "objective cell" value for simple models
+  value_range: tuple[Decimal, Decimal] # INR
+  scenarios: dict[str, Decimal]
+  sensitivity_matrix: dict[str, list]
+  simulation_percentiles: dict | None  # populated only when run_simulation=True (Monte Carlo)
+  components: list["ValuationResult"] | None
+                                        # populated only for model == "sotp" — one result per
+                                        # segment, summed to produce intrinsic_value_per_share
+  peer_multiples_used: dict | None     # populated only for model == "relative" — the peer ratios
+                                        # actually applied, for audit purposes
+  inputs_snapshot: dict                # full copy of every input used
+  currency: str                        # always "INR"
+
+Design note: each model lives in its own class implementing a common BaseModel.compute(request) -> ValuationResult interface. Adding new single-company models (FCFF, FCFE, DDM, EV/EBITDA, EV/Sales, PEG, Residual Income) requires no changes to the engine orchestrator — this is the primary reason the strategy-pattern interface was chosen. SOTP and relative valuation are the two models that don't fit a "flat" result and are why components and peer_multiples_used are reserved on the shared result type now, in Sprint 4, rather than retrofitted later: SOTP composes multiple sub-valuations into one result, and relative valuation depends on a peer set that must be resolved before compute() can run (see Module 7). Monte Carlo is not a distinct model — it is run_simulation=True on top of any existing model, wrapped in Celery once iteration counts make it too slow for the synchronous request path (unchanged from the original Phase 1 decision).
+
+________________________________________
+Module 3 — Versioning system
+Responsibilities: receive a ValuationResult plus metadata and persist it as an immutable version record; provide diff, history, and revert APIs. This is the audit backbone of the platform — every version is frozen on write.
+
+Inputs: ValuationResult + ValuationRequest + optional user note.
+Outputs: a ValuationVersion record with a three-tier version number scoped to the company; diff objects comparing any two versions; the ability to materialise a past ValuationRequest for replay.
+
+Versioning scheme — W.X.Z, not a fourth tier: a change at a given tier resets everything to its right back to 0.
+  - W (version_w) — data ingestion: fresh financials pulled in for the company
+  - X (version_x) — structural/calculation: new model run, new/changed assumptions, a genuinely
+    new Excel structure incorporated (refresh-with-structure)
+  - Z (version_z) — catch-all/tie-breaker: anything that creates a real version but doesn't
+    cleanly fit W or X — a manual note-only save, or a revert
+A fourth "Y" tier for routine API/program-value refreshes was considered and deliberately
+dropped: those refreshes never create a version row at all (see Module 9 / ValuationRefreshLog
+below), so there is nothing for a Y tier to count. The first version of any valuation is 1.0.0.
+
+Key data structures:
+python
+ValuationVersion:
+  id: UUID
+  version_w: int                # data ingestion tier — bumps on new financials, resets X and Z
+  version_x: int                # structural/calculation tier — bumps on model/assumption/
+                                 # structure change, resets Z
+  version_z: int                # catch-all/tie-breaker tier — manual note-only save, revert
+  company_id: UUID
+  model: str
+  inputs_snapshot: JSONB       # full copy, never mutated; includes screened data source label
+  result_snapshot: JSONB       # full ValuationResult copy, INR values
+  workbook_manifest: JSONB | None
+                                # populated once Excel sync (Module 8) is in use — the named
+                                # input-range and named output-range mapping for this version's
+                                # workbook. Deliberately NOT a dependency graph or parsed formula
+                                # set (see Module 8 design note) — just the contract of cell names.
+  parent_version_id: UUID | None
+                                # set when this version was created via "refresh with previous
+                                # structure" (Sprint 7) — lets a version inherit its workbook
+                                # manifest from an earlier version instead of starting a new one
+  created_at: datetime
+  note: str | None
+  created_by: UUID
+                                # serialised/displayed to the user as "W.X.Z", e.g. "1.0.0"
+
+VersionDiff:
+  version_a: str                # "W.X.Z" label of the earlier version
+  version_b: str                # "W.X.Z" label of the later version
+  changed_inputs: list[FieldDiff]
+  intrinsic_value_delta: Decimal       # INR
+  intrinsic_value_delta_pct: Decimal
+
+Design note: the inputs_snapshot and result_snapshot columns are append-only JSONB. No UPDATE ever runs on a version row. A revert creates a new version pre-populated from the old inputs, preserving the audit trail — this always bumps version_z (see the versioning scheme above), since a revert doesn't fit the ingestion or structural tiers. workbook_manifest and parent_version_id follow the same append-only discipline: a "refresh with new financials, same structure" action (Sprint 7) always creates a brand-new ValuationVersion row that copies the manifest forward and points parent_version_id at the version it inherited from — it never mutates the prior version. A refresh that only touches API/program-fed (datasource) values, with no new financials and no structural change, does NOT create a ValuationVersion at all — see Module 9's ValuationRefreshLog.
+
+________________________________________
+Module 4 — Portfolio analytics engine
+Responsibilities: maintain user portfolios (positions, weights, cost basis in INR); compute live performance metrics by joining positions with current prices (from the latest market_data_points scraped from Screener) and latest valuation versions; run scenario simulations for hypothetical trades; expose risk metrics (beta, volatility, correlation, drawdown).
+Inputs: user positions from the portfolio store; latest ValuationVersion records from the versioning module; live MarketDataPoint records from the Screener data cache.
+Outputs: a PortfolioSnapshot with allocation breakdown, aggregate metrics, and per-position upside/downside in INR and percentage terms; TradeImpactSimulation results for what-if analysis.
+
+Key data structures:
+python
+Position:
+  id: UUID
+  portfolio_id: UUID
+  company_id: UUID
+  quantity: Decimal
+  cost_basis_per_share: Decimal        # INR
+  valuation_version_id: UUID | None    # pinned version, null = latest
+
+PortfolioSnapshot:
+  as_of: datetime
+  positions: list[PositionView]
+  total_market_value: Decimal          # INR
+  total_intrinsic_value: Decimal       # INR
+  weighted_upside_pct: Decimal
+  beta: Decimal
+  volatility_30d: Decimal
+  max_drawdown: Decimal
+  currency: str                        # "INR"
+
+PositionView:
+  company_id: UUID
+  ticker: str                          # NSE/BSE ticker e.g. "RELIANCE"
+  exchange: str                        # "NSE" | "BSE"
+  market_price: Decimal                # INR — sourced from Screener.in market_data_points
+  intrinsic_value: Decimal             # INR
+  upside_pct: Decimal
+  weight_pct: Decimal
+  valuation_version: int
+
+________________________________________
+Module 5 — Alert and monitoring service
+Responsibilities: evaluate alert rules on a schedule against Screener.in market data and portfolio snapshots; dispatch notifications via email (SMTP) or browser push; log every alert event for audit. Runs entirely inside Celery workers — never in the API request path. Note: alert price freshness is limited by Screener.in scrape cadence (not real-time tick data); document this clearly to users.
+Inputs: AlertRule records from the database; current MarketDataPoint (sourced from Screener.in) and PortfolioSnapshot from the analytics engine.
+Outputs: AlertEvent records written to the database; email and push notifications dispatched.
+
+Key data structures:
+python
+AlertRule:
+  id: UUID
+  user_id: UUID
+  type: Literal["price_deviation","valuation_change","scrape_variable","custom"]
+  target_id: UUID              # company_id or portfolio_id
+  condition: JSONB             # e.g. {"field": "upside_pct", "op": ">", "threshold": 20}
+  channels: list[str]
+  active: bool
+
+AlertEvent:
+  id: UUID
+  rule_id: UUID
+  triggered_at: datetime
+  message: str
+  payload: JSONB               # snapshot of INR values that triggered it
+  delivered: bool
+
+Scheduling: two Celery beat schedules — a Screener.in data refresh task runs every 4 hours during market hours (09:15–15:30 IST, Monday–Friday, excluding NSE holidays) to keep market_data_points reasonably current; alert evaluation runs immediately after each refresh completes. Outside market hours, refresh runs once every 12 hours to pick up any after-hours data updates Screener may publish. Screener.in is not a real-time feed — communicate this data latency clearly in the README and any user-facing API docs.
+
+NSE market hours note: NSE operates 09:15–15:30 IST. Alert evaluation should use refreshed Screener data, which will lag live NSE prices by the time of the last scrape.
+
+________________________________________
+Module 6 — API gateway
+Responsibilities: HTTP routing, authentication (JWT), rate limiting, request validation, WebSocket connections for live portfolio price feeds. This module contains no business logic — it translates HTTP into internal module calls.
+Inputs: HTTP requests and WebSocket connections from web, Excel export, and Excel add-in clients.
+Outputs: JSON responses; streaming WebSocket price updates (sourced from cached Screener data, not a live tick feed).
+
+Router layout:
+POST   /api/v1/companies                            → create company (or return existing global record) + enqueue Screener scrape
+GET    /api/v1/companies/{id}/financials            → ingestion read (multi-year Screener data)
+GET    /api/v1/companies/{id}/peers/suggestions     → peer comparison service (recommended peers, ratio preview)
+POST   /api/v1/companies/{id}/peers                 → peer comparison service (confirm suggested and/or add new peer tickers)
+POST   /api/v1/companies/{id}/valuations            → valuation engine + versioning; assumption form (mandatory/optional fields) submitted here
+GET    /api/v1/valuations/assumption-schema/{model} → returns the mandatory/optional assumption fields the app should collect for a given model, before running it
+GET    /api/v1/companies/{id}/valuations/versions   → versioning read
+POST   /api/v1/companies/{id}/valuations/refresh    → triggers Celery re-scrape + re-valuation job
+POST   /api/v1/companies/{id}/valuations/{id}/refresh-with-structure
+                                                      → refresh with new financials, reusing a prior
+                                                        version's cell-binding manifest (Module 8)
+GET    /api/v1/companies/{id}/valuations/diff       → versioning diff
+GET    /api/v1/export/excel/{valuation_id}          → Excel export worker: generates a workbook with the
+                                                        app's assumption inputs and output data points
+                                                        pre-bound as named cells (Module 8)
+POST   /api/v1/excel/link/push                       → Add-in push: refresh bound input cells in the
+                                                        currently-open linked workbook (Module 8)
+POST   /api/v1/excel/link/pull                       → Add-in pull: read back bound output cells from the
+                                                        currently-open linked workbook, save new version
+POST   /api/v1/excel/link/fork                       → Add-in: mint a new linked workbook identity, used
+                                                        only when the user explicitly wants a real fork
+GET    /api/v1/datasources                           → data source catalog (built-in + custom + favorites)
+POST   /api/v1/datasources/custom-api                → register a user-defined API-backed data source
+POST   /api/v1/datasources/custom-program             → register a user-defined program-backed data source
+PATCH  /api/v1/datasources/{id}                       → edit a data source's config (bumps its version)
+POST   /api/v1/datasources/{id}/favorite              → toggle favorite flag
+POST   /api/v1/portfolios                           → portfolio analytics
+GET    /api/v1/portfolios/{id}/snapshot             → portfolio analytics
+POST   /api/v1/portfolios/{id}/simulate             → portfolio analytics
+POST   /api/v1/alerts/rules                         → alert service
+WS     /ws/portfolio/{id}/live                      → cached price feed (from Screener data)
+
+Design note on ownership: this is a single-user application (confirmed during architecture
+review) — there is no multi-tenant data isolation to build. companies remain a single
+global, deduplicated table (unique on ticker) for a different reason than tenancy: it
+avoids re-ingesting the same company twice across separate valuation runs. Authentication
+is a single API key or local session, not a per-user permission model. No watchlist,
+user-scoping middleware, or user_id column belongs anywhere in this schema; earlier notes
+in this document proposing a user_watchlist table are superseded by this decision.
+
+________________________________________
+Module 7 — Peer comparison service (relative valuation support)
+
+Responsibilities: resolve a usable peer set for a company when — and only when — a
+relative valuation (P/E, EV/EBITDA, EV/Sales, PEG, P/B) is requested for it. Never runs
+proactively or as part of standard ingestion.
+
+Two distinct, permanently separate data-sourcing tiers — this is the final design after
+architecture review, and neither tier ever converts into the other:
+
+TIER A — recommended peers (from Screener.in's own peer-comparison table):
+Ratios only, sourced entirely from the ORIGINAL company's already-fetched HTML — no
+separate HTTP request, no Company row, no FinancialSnapshot ingestion. These peers exist
+purely to support the relative valuation of the company whose page they were found on.
+
+TIER B — user-added peers (ticker not present in the recommended table):
+Full, independent ingestion — a real Company row is created and the standard
+ingest_company_data Celery task from Module 1 runs, exactly as if the user had entered
+that ticker as a primary valuation subject.
+
+Critical rule, stated explicitly because it was a live design question during review:
+if the user later runs an actual standalone valuation (DCF, etc.) on a company that
+previously only appeared as a Tier A recommended peer, that run triggers a completely
+fresh, independent ingestion. There is no promotion path and no data reuse between a
+company's Tier A peer-ratio appearance and any later real valuation of that same
+company — the peer-ratio data and a full valuation's financial data are permanently
+unrelated artifacts, even if they happen to describe the same ticker.
+
+Flow:
+1. GET /peers/suggestions — ingestion.peer_parser extracts the peer ticker list +
+   comparative ratios already present on the SUBJECT company's own Screener.in page
+   (already fetched during that company's own ingestion; no new external dependency).
+   Cross-checked against sector/industry_group, capped at ~8 shown by default.
+2. User confirms some subset of Tier A suggestions and/or adds arbitrary Tier B tickers
+   manually via POST /peers.
+3. Tier A confirmations are cached as PeerRatioSnapshot rows (see below) — no ingestion
+   task is enqueued. Tier B confirmations enqueue full ingestion (Module 1), the same
+   as creating any new company.
+4. The confirmed peer set (tagged Tier A or Tier B) is attached to the ValuationRequest
+   and stored verbatim in inputs_snapshot when the relative valuation version is saved
+   — so which peers, and from which tier, were used for a given valuation is always
+   auditable, even if the peer set changes later.
+
+Key data structures:
+python
+PeerRatioSnapshot:
+  id: UUID
+  peer_ticker: str
+  peer_name: str
+  sourced_from_company_id: UUID   # the subject company whose HTML this was extracted from
+  sourced_at: datetime            # timestamp of the subject company's own scrape
+  key_ratios: dict                 # P/E, P/B, EV/EBITDA etc. as shown by Screener on the
+                                    # subject company's page — this is the ONLY data Tier A
+                                    # peers ever have; there is no upgrade path to more
+
+CompanyPeerLink:
+  company_id: UUID                 # the subject company
+  peer_ticker: str                 # not a FK to companies for Tier A — Tier A peers may
+                                    # never have a Company row at all
+  tier: Literal["A_recommended_ratio_only","B_user_added_full_ingestion"]
+  peer_company_id: UUID | None     # set only for Tier B, where a real Company row exists
+  added_at: datetime
+
+Design note: storage cost is negligible for Tier A (a small ratios dict, cached once per
+subject company's scrape) and identical to any other company's ingestion for Tier B —
+no new storage pattern is introduced. The only real constraint remains Screener's
+per-request rate limit, already protected by the existing Celery rate-limit guard, and
+Tier A specifically avoids consuming any of that rate-limit budget at all.
+
+________________________________________
+Module 8 — Excel Add-in service (linked workbook sync)
+
+Actual workflow this module supports (clarified during architecture review — this is
+the anchor for every design decision below): the user asks the app to run a valuation
+(e.g. "DCF-FCFE for RELIANCE"). The app returns the mandatory and optional assumption
+fields for that model (GET /valuations/assumption-schema/{model}). The user fills them
+in and runs the valuation IN THE APP — this produces the first ValuationVersion and its
+named output data points. Only then, optionally, does the user download an Excel
+workbook. The workbook is not the starting point of the workflow; it is a derived,
+linked artifact of a valuation the app already ran.
+
+The exported workbook is pre-populated with named cells for exactly two things the app
+already produced: the assumption inputs the user filled in on the form, and the output
+data points the run generated. No manual task-pane binding step is required to create
+these — the export step generates them automatically from the ValuationRequest and
+ValuationResult that already exist. The user is then free to add new assumptions,
+calculation steps, tables, or additional sheets of their own, and to edit the
+app-generated formulas/values directly. Making sure those changes ultimately flow
+through to the output named cells is the user's responsibility — which in practice is
+usually automatic, since Excel recalculates every dependent formula, including the
+user's own, whenever an upstream cell changes.
+
+File linkage — embedded, not server-side: the platform never tracks "which file is the
+original" on its own. Each exported workbook has a link identity written into the file
+itself via Office.js's per-file hidden settings store (Office.context.document.settings),
+which survives save, close, reopen, and Save-As duplication automatically. A duplicated
+file silently stays linked to the same valuation lineage unless the user takes one
+explicit action — "start a new linked version from here" (POST /excel/link/fork) — which
+mints a fresh link identity and starts a new lineage root. This means duplication never
+accidentally forks data, and an intentional fork always requires a deliberate step.
+
+Cell categories, and what the Add-in does with each:
+  - App-bound INPUT cells: the assumption values the app collected. The Add-in pushes
+    fresh values into these on Re-run (e.g. on refresh-with-structure, or when a bound
+    data source — see Module 9 — produces an updated value).
+  - App-bound OUTPUT cells: the objective cells the app reads back (intrinsic value per
+    share, etc.). The Add-in reads these on pull; whether that read produces a new
+    ValuationVersion or just a ValuationRefreshLog entry depends on what the refresh
+    touched (see "Refresh mechanism" below).
+  - Local elements: any new sheet, table, named range, or formula the user adds that is
+    NOT one of the above two. These are never uploaded, never catalogued, and never read
+    by the backend, under any circumstance — the Add-in's read operation is scoped
+    strictly to the fixed output-cell set, nothing else is ever inspected.
+Only app-bound cells are ever created automatically; a user CAN optionally designate an
+extra cell as an additional output via the Add-in task pane, but this is the exception
+path, not how the initial cell set is built.
+
+Refresh mechanism — explicit, button-triggered, not open-triggered: an earlier draft of
+this design considered syncing automatically whenever the linked workbook is next opened
+in Excel, which raised an open question about whether that needs to also work against a
+fully closed file (requiring OneDrive/SharePoint hosting plus a Microsoft Graph API
+background-sync dependency). That ambiguity is resolved by not doing open-triggered sync
+at all: refresh is always an explicit "Re-run" action, available identically in two
+places — a Re-run button in the app, and a Re-run button in the Excel Add-in task pane.
+Both call the same underlying operation while the file is open and linked; neither
+depends on the file's state when closed. On Re-run: the Add-in (or app) calls POST
+/excel/link/push, the backend returns current values for every app-bound input cell
+(latest financials, and any Module 9 data-source values due for refresh), the Add-in
+writes them in, Excel recalculates the entire workbook natively (including all local,
+user-authored formulas — the backend never needs to understand them), and the Add-in
+calls POST /excel/link/pull to read back the output cells. What happens with those
+output values next is decided by VersioningService.resolve_refresh_outcome (Module 3):
+if the refresh brought in new financials or a structural change, it's saved as a new
+ValuationVersion (bumping version_w or version_x per the W.X.Z scheme); if it only
+touched API/program-fed datasource values, nothing about the version changes — instead a
+row is appended to ValuationRefreshLog: id, valuation_version_id (FK — which version
+this refresh ran against), triggered_by ("app" | "excel_addin"), timestamp,
+datasource_outcomes (JSONB — per-source success/fail/fallback-used, and which fallback
+mode was applied), named_outputs (JSONB — the resolved output values/ranges this refresh
+produced). This keeps the version table reserved for changes that actually matter
+structurally, while still giving a full timestamped trail of every refresh and what it
+produced — see Module 9 for how per-source failures and fallbacks feed into this same
+log. If a push or pull step fails outright (a named cell the Add-in expects is missing,
+or a write to a cell fails), the Add-in surfaces a warning in the task pane rather than
+failing silently, following the same pattern as Module 9's datasource failures.
+
+Structure carryover for refreshed financials (Sprint 7): POST
+/valuations/{id}/refresh-with-structure takes an existing version's cell-binding
+manifest (workbook_manifest) and regenerates a workbook with the same input/output
+layout but refreshed input values, creating a new ValuationVersion with
+parent_version_id set — useful when the user wants a clean regenerated workbook rather
+than syncing the one they've been editing.
+
+Design note — why formulas are still never parsed: this remains true even with a live
+Add-in. Parsing and re-executing arbitrary user-authored Excel formulas server-side
+(R1C1 references, array formulas, volatile functions, iterative calculation) would mean
+reimplementing a meaningful chunk of Excel's own calculation engine for a benefit the
+platform doesn't need. The Add-in's job is narrow — push into known input cells, trigger
+Excel's own native recalculation by virtue of those cells changing, read known output
+cells — Excel itself does 100% of the actual calculation work, including for every local
+element the user has added.
+
+Design note — build cost: a live Office Add-in (task pane, Office.js bindings and
+settings API, manifest, sideloading) is a genuinely separate engineering surface from
+the rest of this backend — TypeScript, not Python, and its own testing/debugging loop
+inside Excel itself. This is the correct design for the stated workflow, but it should
+be scoped as its own project phase (Sprint 7+), not folded into backend sprints.
+
+________________________________________
+Module 9 — Dynamic data source catalog (API-fed and program-fed assumption values)
+
+Responsibilities: let assumption values (in the app form, and as Add-in-bound input
+cells in Excel) be sourced from something other than a manually typed number — a
+built-in catalog entry, a user-defined external API call, or a user-authored program —
+and refresh automatically on each new valuation version without manual re-entry.
+
+Three source kinds, one common interface:
+  - catalog_builtin: a small, fixed set of system-defined data points relevant to
+    Indian equity valuation (e.g. risk-free rate, current price, shares outstanding,
+    a peer's ratio). The underlying provider/endpoint each one calls is user-editable;
+    the field itself is not user-created.
+  - custom_api: user-defined — an HTTP endpoint, method, optional auth header, and a
+    JSONPath into the response to extract a single value. No code execution; the
+    executor is a generic authenticated-fetch-and-extract routine. Standard web-client
+    safeguards apply: response-size cap, no following redirects into private/internal
+    network ranges — plus the same timeout and fallback protection as custom_program
+    (below), since an external endpoint can fail or time out just as easily as a script.
+  - custom_program: user-authored code that computes a value (optionally from other
+    already-resolved assumptions). This is the one component in the entire system that
+    requires a genuine sandbox — execution timeout, memory ceiling, and no filesystem
+    or network access unless explicitly granted per-program — because a malformed or
+    runaway script must not be able to degrade the same backend process serving the
+    rest of the app. This is the single most expensive item in the whole roadmap and
+    should be scoped as its own dedicated sprint, not bundled into a "quick" catalog
+    feature.
+
+Timeout and fallback (applies to both custom_program and custom_api): every source of
+either kind carries a user-editable timeout_seconds (pre-filled with 30) and a
+fallback configuration, since a routine execution/fetch failure must degrade the
+valuation gracefully rather than hard-failing it. Two fallback modes, chosen per source:
+  - fixed: resolves to either a literal constant (fallback_value, pre-filled with 1 as
+    a suggested default the user is expected to set meaningfully per source) or a
+    designated cell reference (fallback_cell_ref) elsewhere on the linked workbook —
+    letting the fallback itself be a formula the user maintains in-sheet, rather than
+    only ever a hardcoded number.
+  - last_known_good: reuses the source's own last successfully resolved value
+    (last_known_good_value / last_known_good_at, cached on the DataSource row on every
+    successful resolution) — useful where a stale-but-real value (e.g. yesterday's
+    risk-free rate) is more useful to the model than an arbitrary constant.
+On execution failure (exception, timeout, or bad/unparseable output) for either kind:
+log the failure, resolve the configured fallback, and surface a warning — a toast/popup
+in the app, and the equivalent banner in the Excel Add-in task pane when the failure
+happens during an Add-in-triggered refresh (see Module 8). The same
+fail-visibly-not-silently discipline applies to Screener ingestion (a final surfaced
+warning once Celery's retries are exhausted, not just a server-side log line — Module 1)
+and to Add-in push/pull operations (Module 8).
+
+Favorites: any catalog_builtin, custom_api, or custom_program entry can be flagged
+is_favorite, surfacing it first in the picker used when binding a new assumption field
+— a UI/query convenience, not a new architectural concept.
+
+Key data structure:
+python
+DataSource:
+  id: UUID
+  name: str
+  kind: Literal["catalog_builtin","custom_api","custom_program"]
+  config: JSONB                # endpoint+JSONPath for custom_api; code reference +
+                                # resource limits for custom_program; provider config
+                                # for catalog_builtin — plus, for every kind:
+                                # timeout_seconds (int, default 30) and a fallback block:
+                                # fallback_mode: "fixed" | "last_known_good"; when
+                                # "fixed", fallback_source: "literal" | "cell_reference"
+                                # plus either fallback_value (Decimal) or
+                                # fallback_cell_ref (str)
+  version: int                  # incremented on every config/code edit
+  is_favorite: bool
+  last_known_good_value: Decimal | None   # cached on every successful resolution
+  last_known_good_at: datetime | None
+  created_at: datetime
+  updated_at: datetime
+
+Design note — audit consistency with versioning: because data sources are editable
+after the fact, every resolved AssumptionValue that came from a DataSource must record
+BOTH source_datasource_id and source_datasource_version at the moment it was resolved,
+not just the id — otherwise editing a data source later would silently rewrite what an
+old valuation "used" for its inputs_snapshot, breaking the immutability guarantee every
+other part of versioning depends on. AssumptionValue.source gains a fourth value,
+"datasource", alongside the existing "user" | "scraped" | "default".
+
+Where this plugs into Module 8: any app-bound input cell in a linked workbook can be
+bound to a DataSource instead of a static value; on Add-in push (i.e. on Re-run), the
+backend resolves the source's current value (executing the custom_api call or the
+sandboxed custom_program run as needed, applying the timeout/fallback rules above on
+failure) before writing it into the cell — the Add-in itself has no knowledge of source
+kind, it just receives resolved values to push. Every per-source outcome from that
+resolution (success, or which fallback was used) is what populates
+ValuationRefreshLog.datasource_outcomes for that Re-run (Module 8).
+
+Event bus pattern: modules communicate via Celery tasks rather than direct imports where the operation is async (Screener scrape, data refresh, alert evaluation, Excel generation). Synchronous operations (compute a valuation, read a version diff) are direct function calls within the monolith.
+
+Dependency direction: ingestion → storage ← valuation engine → versioning ← portfolio analytics ← alert service. The alert and portfolio modules read from versioning and storage; nothing reads from the alert module. Peer comparison (Module 7) sits between the API gateway and ingestion — Tier A (recommended) peers never touch ingestion at all, only Tier B (user-added) peers do, on-demand, the same way primary company creation does; the confirmed peer set (with tier) is written into a ValuationRequest before the engine runs, so the engine itself never depends on Module 7 at compute time. The Excel Add-in (Module 8) sits between the API gateway and versioning — a Re-run that brings in new financials or a structural change produces a new ValuationVersion the same way a normal app-run valuation does, just sourced from Add-in push/pull instead of the app form; a Re-run that only refreshes datasource-fed values produces a ValuationRefreshLog entry instead, per the same rule the app's own Re-run button follows. The data source catalog (Module 9) is a small standalone service that both the assumption resolver (Module 2) and the Add-in (Module 8) call into when resolving a bound value, but nothing depends on Module 9 existing — every model works with plain user-entered/scraped values whether or not any DataSource is configured. This one-way dependency graph lets you test each module in isolation.
+
+Scraper resilience: Screener.in's HTML structure is not guaranteed to be stable. The raw_html_payload column preserves the original HTML so that if field_map.py is updated to handle a Screener layout change, historical data can be re-parsed from the stored HTML without re-fetching. Any label that cannot be mapped by field_map.py is logged as a WARNING with the company ticker and raw label text, making regressions detectable without crashing the ingestion job.
+
+Excel export (local storage): the Celery export task renders an .xlsx file server-side using openpyxl and writes it to a local Docker volume (./data/exports/ mounted into the container). The API returns a direct download URL path resolved against the local server. The export_jobs table tracks job status and the file path on disk. The Financials sheet includes a source note row: "Data sourced from Screener.in (screener.in)".
+
+Currency: all monetary values stored and returned by the API are in INR. Company-level figures are stored in INR Crores (Cr) as published by Screener.in; per-share figures are in INR. The currency field is included in ValuationResult and PortfolioSnapshot response objects to make this explicit and to make a future multi-currency extension straightforward.
+
+________________________________________
+Docker Compose service layout
+
+Services defined in docker-compose.yml:
+  db          PostgreSQL 15 — persistent Docker named volume: postgres_data:/var/lib/postgresql/data
+  redis       Redis 7 — used as Celery broker and result backend
+  api         FastAPI app — depends on db and redis; hot-reloads in dev via volume mount
+  worker      Celery worker — same image as api, different entrypoint command; runs Screener scrape tasks
+  beat        Celery beat scheduler — manages periodic tasks (Screener data refresh, alert evaluation)
+
+All five services share a single .env file for configuration. The api, worker, and beat services use the same Docker image built from the project's Dockerfile — this avoids image drift between the web process and background workers.
+
+________________________________________
+Phase-gated implementation order
+
+Start with modules 1 → 2 → 3 in Phase 1 (you need Screener data before valuations, and valuations before versioning). Portfolio analytics (module 4) comes in Phase 2 alongside the web UI, at which point relative valuation and Module 7 (peer comparison, Tier A/B) also become worth building. Alerts (module 5) in Phase 3 once you have a reliable Screener refresh cadence. The Excel Add-in (module 8) targets Phase 3 — it's a genuinely separate engineering surface (TypeScript/Office.js, not Python) and should be scoped as its own project phase rather than folded into a backend sprint; build the app-first assumption/valuation/output workflow (modules 2–3) solidly first, since the Add-in's whole design leans on that workflow already existing and producing named data points to bind to. The dynamic data source catalog (module 9) can start with just catalog_builtin entries alongside module 8, with custom_api following soon after (low build cost); custom_program should be treated as its own later sub-phase given the sandboxing work it requires. The API gateway wrapper builds incrementally alongside each module.
