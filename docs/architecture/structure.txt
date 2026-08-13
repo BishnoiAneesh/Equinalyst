@@ -38,6 +38,11 @@
 │   └── tasks.py
 ├── data
 │   └── exports
+├── docs
+│   └── architecture
+│       ├── Project_Plan_Phase_1.txt
+│       ├── System_Architecture.txt
+│       └── structure.txt
 ├── scripts
 │   ├── __init__.py
 │   └── seed.py
@@ -54,7 +59,6 @@
 ├── README.md
 ├── alembic.ini
 ├── docker-compose.yml
-├── pyproject.toml
-└── structure.txt
+└── pyproject.toml
 
-15 directories, 43 files
+17 directories, 45 files
